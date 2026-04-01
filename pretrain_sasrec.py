@@ -5,17 +5,19 @@ import numpy as np
 
 
 class SimpleSASRec(nn.Module):
-    """
-    A readable SASRec-style sequence encoder.
-    """
     def __init__(self, n_items, hidden_units=64, max_len=50, num_blocks=2, num_heads=1, dropout_rate=0.2):
         super().__init__()
         self.n_items = n_items
         self.hidden_units = hidden_units
         self.max_len = max_len
 
-        self.item_embedding = nn.Embedding(n_items + 1, hidden_units, padding_idx=0)
-        self.pos_embedding = nn.Embedding(max_len, hidden_units)
+        # Item embedding: n_items entries (IDs 0..n_items-1), no padding_idx needed
+        # since ID=0 is now a valid item
+        self.item_embedding = nn.Embedding(n_items, hidden_units)
+
+        # Positional embedding: position 0..max_len-1 in the sequence
+        self.positional_embedding = nn.Embedding(max_len, hidden_units)
+
         self.dropout = nn.Dropout(dropout_rate)
 
         encoder_layer = nn.TransformerEncoderLayer(
@@ -29,21 +31,26 @@ class SimpleSASRec(nn.Module):
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_blocks)
         self.layer_norm = nn.LayerNorm(hidden_units)
 
-    def encode(self, seq):
+    def encode(self, seq, padding_value=-1):
         """
-        seq: [B, L]
-        return hidden states [B, L, H]
+        seq: [B, L] item IDs. padding_value indicates empty positions.
         """
         device = seq.device
         positions = torch.arange(seq.size(1), device=device).unsqueeze(0).expand_as(seq)
 
-        x = self.item_embedding(seq) + self.pos_embedding(positions)
+        # For embedding lookup, replace padding with 0 (any valid index)
+        seq_for_emb = seq.clone()
+        seq_for_emb[seq_for_emb == padding_value] = 0
+
+        x = self.item_embedding(seq_for_emb) + self.positional_embedding(positions)
         x = self.dropout(x)
 
-        # padding mask
-        padding_mask = seq.eq(0)
+        # Mask: True where padding
+        padding_mask = (seq == padding_value)
 
-        # causal mask
+        # Zero out padding positions in the embedding
+        x = x * (~padding_mask).float().unsqueeze(-1)
+
         L = seq.size(1)
         causal_mask = torch.triu(torch.ones(L, L, device=device), diagonal=1).bool()
 
@@ -51,19 +58,28 @@ class SimpleSASRec(nn.Module):
         h = self.layer_norm(h)
         return h
 
-    def forward(self, seq, pos, neg):
+    def forward(self, seq, pos_target, neg_target, padding_value=-1):
         """
-        seq, pos, neg: [B, L]
+        Standard SASRec BPR training loss.
+        seq:        [B, L] input sequence
+        pos_target: [B, L] correct next item at each position
+        neg_target: [B, L] random wrong item at each position
         """
-        h = self.encode(seq)  # [B, L, H]
+        h = self.encode(seq, padding_value)
 
-        pos_emb = self.item_embedding(pos)
-        neg_emb = self.item_embedding(neg)
+        # Replace padding in targets with 0 for embedding lookup
+        pos_for_emb = pos_target.clone()
+        pos_for_emb[pos_for_emb == padding_value] = 0
+        neg_for_emb = neg_target.clone()
+        neg_for_emb[neg_for_emb == padding_value] = 0
+
+        pos_emb = self.item_embedding(pos_for_emb)
+        neg_emb = self.item_embedding(neg_for_emb)
 
         pos_logits = (h * pos_emb).sum(dim=-1)
         neg_logits = (h * neg_emb).sum(dim=-1)
 
-        mask = pos.ne(0).float()
+        mask = (pos_target != padding_value).float()
 
         pos_loss = -torch.log(torch.sigmoid(pos_logits) + 1e-24) * mask
         neg_loss = -torch.log(1.0 - torch.sigmoid(neg_logits) + 1e-24) * mask
@@ -72,28 +88,23 @@ class SimpleSASRec(nn.Module):
         return loss
 
     @torch.no_grad()
-    def export_user_item_embeddings(self, user_history, n_users, device):
-        """
-        Export:
-          user_emb[u] = last hidden state of user's train sequence
-          item_emb = learned item embedding table
-        """
+    def export_user_item_embeddings(self, user_history, n_users, device, padding_value=-1):
         self.eval()
-        user_emb = torch.zeros((n_users + 1, self.hidden_units), dtype=torch.float32, device=device)
+        user_emb = torch.zeros((n_users, self.hidden_units), dtype=torch.float32, device=device)
 
-        for u in range(1, n_users + 1):
+        for u in range(n_users):
             seq_items = user_history.get(u, [])
             if len(seq_items) == 0:
                 continue
 
-            seq = np.zeros(self.max_len, dtype=np.int64)
+            seq = np.full(self.max_len, padding_value, dtype=np.int64)
             trunc = seq_items[-self.max_len:]
             seq[-len(trunc):] = trunc
 
             seq_tensor = torch.tensor(seq, dtype=torch.long, device=device).unsqueeze(0)
-            h = self.encode(seq_tensor)  # [1, L, H]
+            h = self.encode(seq_tensor, padding_value)
 
-            valid_pos = (seq_tensor != 0).sum().item() - 1
+            valid_pos = (seq_tensor != padding_value).sum().item() - 1
             if valid_pos >= 0:
                 user_emb[u] = h[0, valid_pos]
 
@@ -102,19 +113,19 @@ class SimpleSASRec(nn.Module):
 
 
 def pretrain_sasrec(
-    train_dataset,
-    user_history,
-    n_users,
-    n_items,
-    device,
-    hidden_units=64,
-    max_len=50,
-    num_blocks=2,
-    num_heads=1,
-    dropout_rate=0.2,
-    batch_size=128,
-    lr=1e-3,
-    epochs=20,
+        train_dataset,
+        user_history,
+        n_users,
+        n_items,
+        device,
+        hidden_units=64,
+        max_len=50,
+        num_blocks=2,
+        num_heads=1,
+        dropout_rate=0.2,
+        batch_size=128,
+        lr=1e-3,
+        epochs=20,
 ):
     model = SimpleSASRec(
         n_items=n_items,
@@ -132,12 +143,12 @@ def pretrain_sasrec(
         model.train()
         losses = []
 
-        for _, seq, pos, neg in loader:
+        for _, seq, pos_target, neg_target in loader:
             seq = seq.to(device)
-            pos = pos.to(device)
-            neg = neg.to(device)
+            pos_target = pos_target.to(device)
+            neg_target = neg_target.to(device)
 
-            loss = model(seq, pos, neg)
+            loss = model(seq, pos_target, neg_target)
 
             optimizer.zero_grad()
             loss.backward()

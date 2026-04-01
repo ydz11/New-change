@@ -190,7 +190,6 @@ def main():
 
     # ===========================================================
     # 5. Split data 70:15:15
-    #    （老师反馈第4点：替换 leave-one-out）
     # ===========================================================
     train_df, valid_df, test_df = ratio_split(df)
     print(f"Split: #train={len(train_df)}, #valid={len(valid_df)}, #test={len(test_df)}")
@@ -253,8 +252,8 @@ def main():
     all_results = {}
 
     for factor in FACTORS:
-        emb_dim = factor
-        mlp_layers = [emb_dim * 2, emb_dim, emb_dim // 2]
+        emb_dim = factor * 2
+        mlp_layers = [emb_dim, factor]
 
         dropout = 0.1
         if factor >= 32:

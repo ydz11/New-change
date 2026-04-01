@@ -5,10 +5,10 @@ import torch.nn as nn
 class MF(nn.Module):
     def __init__(self, n_users, n_items, embedding_dim=64):
         super().__init__()
-        self.user_emb = nn.Embedding(n_users + 1, embedding_dim, padding_idx=0)
-        self.item_emb = nn.Embedding(n_items + 1, embedding_dim, padding_idx=0)
-        self.user_bias = nn.Embedding(n_users + 1, 1, padding_idx=0)
-        self.item_bias = nn.Embedding(n_items + 1, 1, padding_idx=0)
+        self.user_emb = nn.Embedding(n_users, embedding_dim)
+        self.item_emb = nn.Embedding(n_items, embedding_dim)
+        self.user_bias = nn.Embedding(n_users, 1)
+        self.item_bias = nn.Embedding(n_items, 1)
 
         nn.init.normal_(self.user_emb.weight, std=0.01)
         nn.init.normal_(self.item_emb.weight, std=0.01)

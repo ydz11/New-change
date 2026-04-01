@@ -17,10 +17,7 @@ class EvalDataset(Dataset):
 
 
 def build_eval_candidates(pos_ui, n_items, user_seen_items, num_neg=100, seed=42):
-    """
-    For each user:
-      candidates = [1 positive] + [num_neg sampled negatives]
-    """
+    """IDs start from 0. Items are 0..n_items-1."""
     rng = np.random.default_rng(seed)
     users = pos_ui[:, 0].astype(np.int64)
     pos_items = pos_ui[:, 1].astype(np.int64)
@@ -28,15 +25,15 @@ def build_eval_candidates(pos_ui, n_items, user_seen_items, num_neg=100, seed=42
     candidates = np.zeros((len(users), 1 + num_neg), dtype=np.int64)
     candidates[:, 0] = pos_items
 
-    all_items = np.arange(1, n_items + 1, dtype=np.int64)
+    all_items = np.arange(0, n_items, dtype=np.int64)  # 0-indexed
 
     for idx, (u, pos_i) in enumerate(zip(users.tolist(), pos_items.tolist())):
         excluded = set(user_seen_items[int(u)])
         excluded.add(int(pos_i))
 
         mask = np.ones(n_items, dtype=bool)
-        excluded_idx = np.array(list(excluded), dtype=np.int64) - 1
-        mask[excluded_idx] = False
+        excluded_arr = np.array(list(excluded), dtype=np.int64)
+        mask[excluded_arr] = False
         pool = all_items[mask]
 
         sampled = rng.choice(pool, size=num_neg, replace=False)
