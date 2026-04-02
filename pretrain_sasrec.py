@@ -1,3 +1,5 @@
+
+
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -10,14 +12,8 @@ class SimpleSASRec(nn.Module):
         self.n_items = n_items
         self.hidden_units = hidden_units
         self.max_len = max_len
-
-        # Item embedding: n_items entries (IDs 0..n_items-1), no padding_idx needed
-        # since ID=0 is now a valid item
         self.item_embedding = nn.Embedding(n_items, hidden_units)
-
-        # Positional embedding: position 0..max_len-1 in the sequence
         self.positional_embedding = nn.Embedding(max_len, hidden_units)
-
         self.dropout = nn.Dropout(dropout_rate)
 
         encoder_layer = nn.TransformerEncoderLayer(
@@ -32,9 +28,7 @@ class SimpleSASRec(nn.Module):
         self.layer_norm = nn.LayerNorm(hidden_units)
 
     def encode(self, seq, padding_value=-1):
-        """
-        seq: [B, L] item IDs. padding_value indicates empty positions.
-        """
+
         device = seq.device
         positions = torch.arange(seq.size(1), device=device).unsqueeze(0).expand_as(seq)
 
@@ -59,12 +53,6 @@ class SimpleSASRec(nn.Module):
         return h
 
     def forward(self, seq, pos_target, neg_target, padding_value=-1):
-        """
-        Standard SASRec BPR training loss.
-        seq:        [B, L] input sequence
-        pos_target: [B, L] correct next item at each position
-        neg_target: [B, L] random wrong item at each position
-        """
         h = self.encode(seq, padding_value)
 
         # Replace padding in targets with 0 for embedding lookup
@@ -113,19 +101,19 @@ class SimpleSASRec(nn.Module):
 
 
 def pretrain_sasrec(
-        train_dataset,
-        user_history,
-        n_users,
-        n_items,
-        device,
-        hidden_units=64,
-        max_len=50,
-        num_blocks=2,
-        num_heads=1,
-        dropout_rate=0.2,
-        batch_size=128,
-        lr=1e-3,
-        epochs=20,
+    train_dataset,
+    user_history,
+    n_users,
+    n_items,
+    device,
+    hidden_units=64,
+    max_len=50,
+    num_blocks=2,
+    num_heads=1,
+    dropout_rate=0.2,
+    batch_size=128,
+    lr=1e-3,
+    epochs=20,
 ):
     model = SimpleSASRec(
         n_items=n_items,

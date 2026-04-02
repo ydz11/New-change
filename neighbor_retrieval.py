@@ -4,7 +4,6 @@ from sklearn.metrics.pairwise import cosine_similarity
 
 
 def build_rating_matrix(train_uir, n_users, n_items):
-    """IDs start from 0 now, so no -1 offset needed."""
     rows = train_uir[:, 0].astype(np.int64)
     cols = train_uir[:, 1].astype(np.int64)
     vals = train_uir[:, 2].astype(np.float32)

@@ -13,8 +13,6 @@ from data_utils import (
     filter_cold_start,
     reindex_ids,
     ratio_split,
-    build_user_history,
-    build_user_seen_items,
     build_train_uir,
     build_ui,
     get_num_users_items,
@@ -55,7 +53,6 @@ SASREC_BATCH_SIZE = 128
 TOP_K = 10
 NUM_NEG_EVAL = 100
 
-# Cold-start filtering thresholds
 MIN_USER_INTERACTIONS = 5
 MIN_ITEM_INTERACTIONS = 5
 
@@ -160,85 +157,61 @@ def plot_results(results, save_dir):
 def main():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    # ===========================================================
     # 1. Load data
-    # ===========================================================
     df = load_ratings(DATA_PATH)
     print(f"Raw data: {len(df)} interactions, "
           f"{df['user_id'].nunique()} users, {df['item_id'].nunique()} items")
 
-    # ===========================================================
-    # 2.
-    # 0sers BEFORE anything else
-    # ===========================================================
+    # 2. Filter cold-start BEFORE anything else
     df = filter_cold_start(df,
                            min_user_interactions=MIN_USER_INTERACTIONS,
                            min_item_interactions=MIN_ITEM_INTERACTIONS)
     print(f"After cold-start filtering: {len(df)} interactions, "
           f"{df['user_id'].nunique()} users, {df['item_id'].nunique()} items")
 
-    # ===========================================================
-    # 3. Reindex user_id and item_id to be contiguous from 1
-    # ===========================================================
     df = reindex_ids(df)
-
-    # ===========================================================
-    # 4. Get num users/items using nunique
-    # ===========================================================
     n_users, n_items = get_num_users_items(df)
     print(f"After reindexing: n_users={n_users}, n_items={n_items}")
 
-    # ===========================================================
-    # 5. Split data 70:15:15
-    # ===========================================================
+    # 3. Split data 70:15:15 (strict temporal, high-rating eval only)
     train_df, valid_df, test_df = ratio_split(df)
     print(f"Split: #train={len(train_df)}, #valid={len(valid_df)}, #test={len(test_df)}")
 
-    # ===========================================================
-    # 6. Prepare data structures
-    # ===========================================================
-    train_uir = build_train_uir(train_df)
-
-    valid_ui = build_ui(valid_df)
+    # 4. Prepare data structures
+    train_uir = build_train_uir(train_df)  # [user, item, rating, timestamp]
+    valid_ui = build_ui(valid_df)          # [user, item, timestamp]
     test_ui = build_ui(test_df)
 
-    user_history = build_user_history(train_df)
+    user_history = {}
+    for uid, grp in train_df.groupby("user_id"):
+        grp = grp.sort_values("timestamp")
+        user_history[int(uid)] = grp["item_id"].astype(int).tolist()
 
-    user_train_seen = build_user_seen_items(train_df, n_users)
-
-    user_train_valid_seen = [set() for _ in range(n_users + 1)]
+    user_train_seen = [set() for _ in range(n_users)]
     for row in train_df.itertuples(index=False):
-        user_train_valid_seen[int(row.user_id)].add(int(row.item_id))
-    for row in valid_df.itertuples(index=False):
-        user_train_valid_seen[int(row.user_id)].add(int(row.item_id))
+        user_train_seen[int(row.user_id)].add(int(row.item_id))
 
-    # ===========================================================
     # Step 1: Compute cosine-based neighbors
-    # ===========================================================
     print("\n--- Step 1: Computing neighbors ---")
     user_neighbors, item_neighbors = build_neighbor_dicts(
-        train_uir=train_uir[:, :3].astype(np.float32),  # 只传 [user, item, rating]
+        train_uir=train_uir[:, :3].astype(np.float32),  # [user, item, rating]
         n_users=n_users,
         n_items=n_items,
         k=NEIGHBOR_K,
         sim_threshold=0.0,
     )
 
-    # ===========================================================
     # Build evaluation candidates
-    # ===========================================================
     valid_users, valid_candidates = build_eval_candidates(
-        valid_ui[:, :2].astype(np.int64),  # 只传 [user, item]
+        valid_ui[:, :2].astype(np.int64),
         n_items, user_train_seen, num_neg=NUM_NEG_EVAL, seed=42
     )
     test_users, test_candidates = build_eval_candidates(
-        test_ui[:, :2].astype(np.int64),  # 只传 [user, item]
-        n_items, user_train_valid_seen, num_neg=NUM_NEG_EVAL, seed=42
+        test_ui[:, :2].astype(np.int64),
+        n_items, user_train_seen, num_neg=NUM_NEG_EVAL, seed=42
     )
 
-    # ===========================================================
     # Build training dataset
-    # ===========================================================
     train_dataset = RatingWithNegDataset(
         train_df=train_df,
         n_items=n_items,
@@ -246,12 +219,12 @@ def main():
         seed=42,
     )
 
-    # ===========================================================
     # Run experiments for each factor
-    # ===========================================================
     all_results = {}
 
     for factor in FACTORS:
+        # NCF paper: factor = predictive factors (last MLP layer)
+        # emb_dim = factor * 2, MLP halves down to factor
         emb_dim = factor * 2
         mlp_layers = [emb_dim, factor]
 
@@ -262,10 +235,10 @@ def main():
             dropout = 0.2
 
         print(f"\n{'='*60}")
-        print(f"Factor = {factor}, emb_dim = {emb_dim}")
+        print(f"Factor = {factor}, emb_dim = {emb_dim}, mlp = {mlp_layers}")
         print(f"{'='*60}")
 
-        # --- Step 2: Pretrain SASRec ---
+        # Step 2: Pretrain SASRec
         print(f"\n--- Step 2: Pretraining SASRec (dim={emb_dim}) ---")
 
         sasrec_train_dataset = SasRecTrainDataset(
@@ -292,7 +265,7 @@ def main():
             epochs=SASREC_EPOCHS,
         )
 
-        # --- Build models ---
+        # Build models
         models = {
             "MF": MF(n_users, n_items, embedding_dim=emb_dim),
 
@@ -308,7 +281,7 @@ def main():
             ),
         }
 
-        # --- Train all models ---
+        # Train all models
         best_models = {}
         for name, model in models.items():
             print(f"\n--- Training {name} (factor={factor}) ---")
@@ -320,7 +293,7 @@ def main():
                 model_name=f"{name}-f{factor}",
             )
 
-        # --- Test all models ---
+        # Test all models
         factor_results = {}
         print(f"\n--- Test Results (factor={factor}) ---")
         for name, model in best_models.items():
@@ -330,9 +303,7 @@ def main():
 
         all_results[factor] = factor_results
 
-    # ===========================================================
     # Save results
-    # ===========================================================
     with open(OUTPUT_DIR / "results_by_factor.json", "w", encoding="utf-8") as f:
         json.dump(all_results, f, indent=2)
 
