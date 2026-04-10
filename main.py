@@ -50,7 +50,9 @@ PATIENCE = 5
 SASREC_MAXLEN = 50
 SASREC_EPOCHS = 20
 SASREC_BATCH_SIZE = 128
-SASREC_NUM_NEG = 1
+SASREC_NUM_NEG = 1  # negative samples per position for SASRec pretraining
+                     # (separate from NUM_NEG_TRAIN used in rating model training)
+
 TOP_K = 10
 NUM_NEG_EVAL = 100
 
@@ -218,16 +220,10 @@ def main():
         group = group.sort_values("timestamp")
         user_history[int(user_id)] = group["item_id"].astype(int).tolist()
 
-    # user_train_seen: 直接从train_df提取每个用户交互过的item集合
-    user_train_seen = [set() for _ in range(n_users + 1)]
-    for row in train_df.itertuples(index=False):
-        user_train_seen[int(row.user_id)].add(int(row.item_id))
-
-    user_train_valid_seen = [set() for _ in range(n_users + 1)]
-    for row in train_df.itertuples(index=False):
-        user_train_valid_seen[int(row.user_id)].add(int(row.item_id))
-    for row in valid_df.itertuples(index=False):
-        user_train_valid_seen[int(row.user_id)].add(int(row.item_id))
+    # user_all_seen: 用于valid和test评估时的负采样排除集
+    user_all_seen = [set() for _ in range(n_users + 1)]
+    for row in df.itertuples(index=False):
+        user_all_seen[int(row.user_id)].add(int(row.item_id))
 
     # ===========================================================
     # Step 1: Compute cosine-based neighbors
@@ -246,11 +242,11 @@ def main():
     # ===========================================================
     valid_users, valid_candidates = build_eval_candidates(
         valid_ui[:, :2].astype(np.int64),
-        n_items, user_train_seen, num_neg=NUM_NEG_EVAL, seed=42
+        n_items, user_all_seen, num_neg=NUM_NEG_EVAL, seed=42
     )
     test_users, test_candidates = build_eval_candidates(
         test_ui[:, :2].astype(np.int64),
-        n_items, user_train_valid_seen, num_neg=NUM_NEG_EVAL, seed=42
+        n_items, user_all_seen, num_neg=NUM_NEG_EVAL, seed=42
     )
 
     # ===========================================================
@@ -292,6 +288,7 @@ def main():
         train_dataset = RatingWithNegDataset(
             train_df=train_df,
             n_items=n_items,
+            user_all_seen=user_all_seen,
             num_neg=num_neg_train,
             seed=42,
         )
@@ -303,6 +300,7 @@ def main():
             user_history=user_history,
             n_users=n_users,
             n_items=n_items,
+            user_all_seen=user_all_seen,
             max_len=SASREC_MAXLEN,
             sasrec_num_neg=sasrec_num_neg,
             seed=42,

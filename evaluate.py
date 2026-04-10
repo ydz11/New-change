@@ -21,16 +21,23 @@ def build_eval_candidates(eval_user_item_pairs, n_items, user_seen_items, num_ne
     users = eval_user_item_pairs[:, 0].astype(np.int64)
     pos_items = eval_user_item_pairs[:, 1].astype(np.int64)
 
+    # Build per-user set of ALL positive items in this eval set,
+    # so that when sampling negatives for one positive, the other
+    # positives of the same user are also excluded.
+    from collections import defaultdict
+    user_eval_pos = defaultdict(set)
+    for u, i in zip(users.tolist(), pos_items.tolist()):
+        user_eval_pos[u].add(i)
+
     candidates = np.zeros((len(users), 1 + num_neg), dtype=np.int64)
     candidates[:, 0] = pos_items
 
     all_items = np.arange(1, n_items + 1, dtype=np.int64)
 
     for idx, (u, pos_i) in enumerate(zip(users.tolist(), pos_items.tolist())):
-        # Exclude items the user has seen in prior splits (same criteria as
-        # training negative sampling), plus the current positive item itself
+        # Exclude: items seen in prior splits + ALL eval positives of this user
         excluded = set(user_seen_items[int(u)])
-        excluded.add(int(pos_i))
+        excluded.update(user_eval_pos[u])
 
         mask = np.ones(n_items, dtype=bool)
         excluded_idx = np.array(list(excluded), dtype=np.int64) - 1

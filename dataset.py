@@ -21,7 +21,7 @@ class RatingTrainDataset(Dataset):
 
 
 class RatingWithNegDataset(Dataset):
-    def __init__(self, train_df, n_items, num_neg=4, seed=42):
+    def __init__(self, train_df, n_items, user_all_seen, num_neg=4, seed=42):
         self.n_items = n_items
         self.num_neg = num_neg
         self.rng = np.random.default_rng(seed)
@@ -31,10 +31,13 @@ class RatingWithNegDataset(Dataset):
         self.pos_ratings = train_df["rating"].values.astype(np.float32)
         self.n_pos = len(self.pos_users)
 
-        # user -> set of interacted items
+        # user -> set of ALL interacted items (from full df, not just train_df)
+        # so that negatives never include items the user has interacted with
+        # in any split (including discarded low-rating items in valid/test)
         self.user_pos_items = {}
-        for u, i in zip(self.pos_users, self.pos_items):
-            self.user_pos_items.setdefault(int(u), set()).add(int(i))
+        for u in range(len(user_all_seen)):
+            if len(user_all_seen[u]) > 0:
+                self.user_pos_items[u] = user_all_seen[u]
 
         self.users = None
         self.items = None
@@ -84,13 +87,14 @@ class RatingWithNegDataset(Dataset):
 
 
 class SasRecTrainDataset(Dataset):
-    def __init__(self, user_history, n_users, n_items, max_len=50,
-                 sasrec_num_neg=1, seed=42):
+    def __init__(self, user_history, n_users, n_items, user_all_seen,
+                 max_len=50, sasrec_num_neg=1, seed=42):
         self.user_history = user_history
         self.n_users = n_users
         self.n_items = n_items
         self.max_len = max_len
         self.sasrec_num_neg = sasrec_num_neg
+        self.user_all_seen = user_all_seen
         self.rng = np.random.default_rng(seed)
 
         self.valid_users = [u for u in range(1, n_users + 1) if len(user_history.get(u, [])) >= 2]
@@ -104,11 +108,12 @@ class SasRecTrainDataset(Dataset):
 
         seq = np.zeros(self.max_len, dtype=np.int64)
         pos = np.zeros(self.max_len, dtype=np.int64)
+        # neg shape: [max_len, sasrec_num_neg]
         neg = np.zeros((self.max_len, self.sasrec_num_neg), dtype=np.int64)
 
         nxt = seq_items[-1]
         ptr = self.max_len - 1
-        seen = set(seq_items)
+        seen = self.user_all_seen[u]
 
         for item in reversed(seq_items[:-1]):
             seq[ptr] = item
