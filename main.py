@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+from itertools import product as grid_product
 
 import matplotlib
 matplotlib.use("Agg")
@@ -13,6 +14,8 @@ from data_utils import (
     filter_cold_start,
     reindex_ids,
     ratio_split,
+    build_user_history,
+    build_user_seen_items,
     build_train_uir,
     build_ui,
     get_num_users_items,
@@ -49,12 +52,27 @@ PATIENCE = 5
 SASREC_MAXLEN = 50
 SASREC_EPOCHS = 20
 SASREC_BATCH_SIZE = 128
+SASREC_NUM_NEG = 1  # negative samples per position for SASRec pretraining
+                     # (separate from NUM_NEG_TRAIN used in rating model training)
 
 TOP_K = 10
 NUM_NEG_EVAL = 100
 
+# Cold-start filtering thresholds
 MIN_USER_INTERACTIONS = 5
 MIN_ITEM_INTERACTIONS = 5
+
+# =============================================================
+# GridSearch hyperparameter grid
+# =============================================================
+GRID = {
+    "factor":       [8, 16, 32, 64],
+    "lr":           [1e-4, 5e-4, 1e-3, 5e-3],
+    "weight_decay": [1e-5, 1e-4, 1e-3],
+    "num_neg_train": [2, 4, 6],
+    "dropout":      [0.1, 0.2, 0.3],
+    "sasrec_num_neg": [1, 2, 4],
+}
 
 
 # =============================================================
@@ -62,7 +80,9 @@ MIN_ITEM_INTERACTIONS = 5
 # =============================================================
 
 def train_rating_model(model, train_dataset, valid_users, valid_candidates,
-                       model_name, lr=LR, weight_decay=WEIGHT_DECAY):
+                       model_name, lr=LR, weight_decay=WEIGHT_DECAY,
+                       epochs=TRAIN_EPOCHS, batch_size=TRAIN_BATCH_SIZE,
+                       patience=PATIENCE):
     model = model.to(DEVICE)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     loss_fn = torch.nn.MSELoss()
@@ -71,9 +91,9 @@ def train_rating_model(model, train_dataset, valid_users, valid_candidates,
     best_state = None
     no_improve = 0
 
-    for epoch in range(1, TRAIN_EPOCHS + 1):
+    for epoch in range(1, epochs + 1):
         train_dataset.resample_negatives()
-        train_loader = DataLoader(train_dataset, batch_size=TRAIN_BATCH_SIZE, shuffle=True)
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
 
         model.train()
         epoch_losses = []
@@ -106,12 +126,12 @@ def train_rating_model(model, train_dataset, valid_users, valid_candidates,
             no_improve = 0
         else:
             no_improve += 1
-            if no_improve >= PATIENCE:
+            if no_improve >= patience:
                 print(f"[{model_name}] Early stopping at epoch {epoch}")
                 break
 
     model.load_state_dict(best_state)
-    return model
+    return model, best_ndcg
 
 
 # =============================================================
@@ -157,95 +177,138 @@ def plot_results(results, save_dir):
 def main():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
+    # ===========================================================
     # 1. Load data
+    # ===========================================================
     df = load_ratings(DATA_PATH)
     print(f"Raw data: {len(df)} interactions, "
           f"{df['user_id'].nunique()} users, {df['item_id'].nunique()} items")
 
-    # 2. Filter cold-start BEFORE anything else
+    # ===========================================================
+    # 2.
+    # 0sers BEFORE anything else
+    # ===========================================================
     df = filter_cold_start(df,
                            min_user_interactions=MIN_USER_INTERACTIONS,
                            min_item_interactions=MIN_ITEM_INTERACTIONS)
     print(f"After cold-start filtering: {len(df)} interactions, "
           f"{df['user_id'].nunique()} users, {df['item_id'].nunique()} items")
 
+    # ===========================================================
+    # 3. Reindex user_id and item_id to be contiguous from 1
+    # ===========================================================
     df = reindex_ids(df)
+
+    # ===========================================================
+    # 4. Get num users/items using nunique
+    # ===========================================================
     n_users, n_items = get_num_users_items(df)
     print(f"After reindexing: n_users={n_users}, n_items={n_items}")
 
-    # 3. Split data 70:15:15 (strict temporal, high-rating eval only)
+    # ===========================================================
+    # 5. Split data 70:15:15
+    # ===========================================================
     train_df, valid_df, test_df = ratio_split(df)
     print(f"Split: #train={len(train_df)}, #valid={len(valid_df)}, #test={len(test_df)}")
 
-    # 4. Prepare data structures
-    train_uir = build_train_uir(train_df)  # [user, item, rating, timestamp]
-    valid_ui = build_ui(valid_df)          # [user, item, timestamp]
+    # ===========================================================
+    # 6. Prepare data structures
+    # ===========================================================
+    train_uir = build_train_uir(train_df)
+
+    valid_ui = build_ui(valid_df)
     test_ui = build_ui(test_df)
 
-    user_history = {}
-    for uid, grp in train_df.groupby("user_id"):
-        grp = grp.sort_values("timestamp")
-        user_history[int(uid)] = grp["item_id"].astype(int).tolist()
+    user_history = build_user_history(train_df)
 
-    user_train_seen = [set() for _ in range(n_users)]
+    user_train_seen = build_user_seen_items(train_df, n_users)
+
+    user_train_valid_seen = [set() for _ in range(n_users + 1)]
     for row in train_df.itertuples(index=False):
-        user_train_seen[int(row.user_id)].add(int(row.item_id))
+        user_train_valid_seen[int(row.user_id)].add(int(row.item_id))
+    for row in valid_df.itertuples(index=False):
+        user_train_valid_seen[int(row.user_id)].add(int(row.item_id))
 
+    # ===========================================================
     # Step 1: Compute cosine-based neighbors
+    # ===========================================================
     print("\n--- Step 1: Computing neighbors ---")
     user_neighbors, item_neighbors = build_neighbor_dicts(
-        train_uir=train_uir[:, :3].astype(np.float32),  # [user, item, rating]
+        train_uir=train_uir[:, :3].astype(np.float32),  # 只传 [user, item, rating]
         n_users=n_users,
         n_items=n_items,
         k=NEIGHBOR_K,
         sim_threshold=0.0,
     )
 
+    # ===========================================================
     # Build evaluation candidates
+    # eval_user_item_pairs: [N, 2] array of (user_id, positive_item_id)
+    # Each user may have MULTIPLE positive items (rows) in valid/test.
+    # Negative sampling excludes the same items as training negatives.
+    # ===========================================================
     valid_users, valid_candidates = build_eval_candidates(
-        valid_ui[:, :2].astype(np.int64),
+        valid_ui[:, :2].astype(np.int64),  # (user_id, item_id) pairs
         n_items, user_train_seen, num_neg=NUM_NEG_EVAL, seed=42
     )
     test_users, test_candidates = build_eval_candidates(
-        test_ui[:, :2].astype(np.int64),
-        n_items, user_train_seen, num_neg=NUM_NEG_EVAL, seed=42
+        test_ui[:, :2].astype(np.int64),  # (user_id, item_id) pairs
+        n_items, user_train_valid_seen, num_neg=NUM_NEG_EVAL, seed=42
     )
 
-    # Build training dataset
-    train_dataset = RatingWithNegDataset(
-        train_df=train_df,
-        n_items=n_items,
-        num_neg=NUM_NEG_TRAIN,
-        seed=42,
-    )
+    # ===========================================================
+    # Build training dataset (will be rebuilt per grid config)
+    # ===========================================================
 
-    # Run experiments for each factor
-    all_results = {}
+    # ===========================================================
+    # GridSearch over all hyperparameters
+    # All tuning data is saved to disk for the experiment section.
+    # ===========================================================
+    all_tuning_results = []  # list of dicts, one per grid config
+    best_per_model = {}      # model_name -> {best config, best valid ndcg}
 
-    for factor in FACTORS:
-        # NCF paper: factor = predictive factors (last MLP layer)
-        # emb_dim = factor * 2, MLP halves down to factor
+    grid_keys = list(GRID.keys())
+    grid_values = list(GRID.values())
+    total_configs = 1
+    for v in grid_values:
+        total_configs *= len(v)
+    print(f"\n{'='*60}")
+    print(f"GridSearch: {total_configs} total configurations")
+    print(f"{'='*60}")
+
+    config_idx = 0
+    for combo in grid_product(*grid_values):
+        config = dict(zip(grid_keys, combo))
+        config_idx += 1
+        factor = config["factor"]
+        lr = config["lr"]
+        weight_decay = config["weight_decay"]
+        num_neg_train = config["num_neg_train"]
+        dropout = config["dropout"]
+        sasrec_num_neg = config["sasrec_num_neg"]
+
         emb_dim = factor * 2
         mlp_layers = [emb_dim, factor]
 
-        dropout = 0.1
-        if factor >= 32:
-            dropout = 0.3
-        elif factor >= 16:
-            dropout = 0.2
-
         print(f"\n{'='*60}")
-        print(f"Factor = {factor}, emb_dim = {emb_dim}, mlp = {mlp_layers}")
+        print(f"[Config {config_idx}/{total_configs}] {config}")
         print(f"{'='*60}")
 
-        # Step 2: Pretrain SASRec
-        print(f"\n--- Step 2: Pretraining SASRec (dim={emb_dim}) ---")
+        # --- Rebuild training dataset with this config's num_neg_train ---
+        train_dataset = RatingWithNegDataset(
+            train_df=train_df,
+            n_items=n_items,
+            num_neg=num_neg_train,
+            seed=42,
+        )
 
+        # --- Pretrain SASRec with this config's sasrec_num_neg ---
         sasrec_train_dataset = SasRecTrainDataset(
             user_history=user_history,
             n_users=n_users,
             n_items=n_items,
             max_len=SASREC_MAXLEN,
+            sasrec_num_neg=sasrec_num_neg,
             seed=42,
         )
 
@@ -265,7 +328,7 @@ def main():
             epochs=SASREC_EPOCHS,
         )
 
-        # Build models
+        # --- Build and train all models with this config ---
         models = {
             "MF": MF(n_users, n_items, embedding_dim=emb_dim),
 
@@ -281,35 +344,80 @@ def main():
             ),
         }
 
-        # Train all models
-        best_models = {}
         for name, model in models.items():
-            print(f"\n--- Training {name} (factor={factor}) ---")
-            best_models[name] = train_rating_model(
+            print(f"\n--- Training {name} (config {config_idx}) ---")
+            trained_model, valid_ndcg = train_rating_model(
                 model=model,
                 train_dataset=train_dataset,
                 valid_users=valid_users,
                 valid_candidates=valid_candidates,
-                model_name=f"{name}-f{factor}",
+                model_name=f"{name}-cfg{config_idx}",
+                lr=lr,
+                weight_decay=weight_decay,
             )
 
-        # Test all models
-        factor_results = {}
-        print(f"\n--- Test Results (factor={factor}) ---")
-        for name, model in best_models.items():
-            hr, ndcg = evaluate_model(model, test_users, test_candidates, TOP_K, DEVICE)
-            factor_results[name] = {"hr": hr, "ndcg": ndcg}
-            print(f"  {name:15s}  HR@{TOP_K}={hr:.4f}  NDCG@{TOP_K}={ndcg:.4f}")
+            # Evaluate on validation set
+            valid_hr, valid_ndcg = evaluate_model(
+                trained_model, valid_users, valid_candidates, TOP_K, DEVICE
+            )
+            # Evaluate on test set
+            test_hr, test_ndcg = evaluate_model(
+                trained_model, test_users, test_candidates, TOP_K, DEVICE
+            )
 
-        all_results[factor] = factor_results
+            result_row = {
+                "config_idx": config_idx,
+                "model": name,
+                **config,
+                "valid_hr": valid_hr,
+                "valid_ndcg": valid_ndcg,
+                "test_hr": test_hr,
+                "test_ndcg": test_ndcg,
+            }
+            all_tuning_results.append(result_row)
 
-    # Save results
+            # Track best config per model (by validation NDCG)
+            if name not in best_per_model or valid_ndcg > best_per_model[name]["valid_ndcg"]:
+                best_per_model[name] = result_row.copy()
+
+            print(f"  {name:15s}  valid_hr@{TOP_K}={valid_hr:.4f}  valid_ndcg@{TOP_K}={valid_ndcg:.4f}"
+                  f"  test_hr@{TOP_K}={test_hr:.4f}  test_ndcg@{TOP_K}={test_ndcg:.4f}")
+
+        # --- Save tuning results incrementally (in case of crash) ---
+        with open(OUTPUT_DIR / "gridsearch_all_results.json", "w", encoding="utf-8") as f:
+            json.dump(all_tuning_results, f, indent=2)
+
+    # ===========================================================
+    # Save final results
+    # ===========================================================
+    with open(OUTPUT_DIR / "gridsearch_all_results.json", "w", encoding="utf-8") as f:
+        json.dump(all_tuning_results, f, indent=2)
+
+    with open(OUTPUT_DIR / "gridsearch_best_per_model.json", "w", encoding="utf-8") as f:
+        json.dump(best_per_model, f, indent=2)
+
+    # --- Build summary table grouped by factor (for backward compat) ---
+    all_results = {}
+    for name, best in best_per_model.items():
+        factor = best["factor"]
+        if factor not in all_results:
+            all_results[factor] = {}
+        all_results[factor][name] = {"hr": best["test_hr"], "ndcg": best["test_ndcg"]}
+
     with open(OUTPUT_DIR / "results_by_factor.json", "w", encoding="utf-8") as f:
         json.dump(all_results, f, indent=2)
 
-    plot_results(all_results, OUTPUT_DIR)
+    # Plot best results per factor
+    if all_results:
+        plot_results(all_results, OUTPUT_DIR)
 
-    print(f"\nResults saved to {OUTPUT_DIR}")
+    print(f"\n{'='*60}")
+    print(f"GridSearch complete. All {len(all_tuning_results)} results saved to {OUTPUT_DIR}")
+    print(f"Best config per model:")
+    for name, best in best_per_model.items():
+        print(f"  {name}: valid_ndcg={best['valid_ndcg']:.4f}, "
+              f"test_ndcg={best['test_ndcg']:.4f}, config={best}")
+    print(f"{'='*60}")
 
 
 if __name__ == "__main__":

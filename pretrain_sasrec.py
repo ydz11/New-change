@@ -1,5 +1,3 @@
-
-
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -7,13 +5,17 @@ import numpy as np
 
 
 class SimpleSASRec(nn.Module):
+    """
+    A readable SASRec-style sequence encoder.
+    """
     def __init__(self, n_items, hidden_units=64, max_len=50, num_blocks=2, num_heads=1, dropout_rate=0.2):
         super().__init__()
         self.n_items = n_items
         self.hidden_units = hidden_units
         self.max_len = max_len
-        self.item_embedding = nn.Embedding(n_items, hidden_units)
-        self.positional_embedding = nn.Embedding(max_len, hidden_units)
+
+        self.item_embedding = nn.Embedding(n_items + 1, hidden_units, padding_idx=0)
+        self.pos_embedding = nn.Embedding(max_len, hidden_units)
         self.dropout = nn.Dropout(dropout_rate)
 
         encoder_layer = nn.TransformerEncoderLayer(
@@ -27,24 +29,21 @@ class SimpleSASRec(nn.Module):
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_blocks)
         self.layer_norm = nn.LayerNorm(hidden_units)
 
-    def encode(self, seq, padding_value=-1):
-
+    def encode(self, seq):
+        """
+        seq: [B, L]
+        return hidden states [B, L, H]
+        """
         device = seq.device
         positions = torch.arange(seq.size(1), device=device).unsqueeze(0).expand_as(seq)
 
-        # For embedding lookup, replace padding with 0 (any valid index)
-        seq_for_emb = seq.clone()
-        seq_for_emb[seq_for_emb == padding_value] = 0
-
-        x = self.item_embedding(seq_for_emb) + self.positional_embedding(positions)
+        x = self.item_embedding(seq) + self.pos_embedding(positions)
         x = self.dropout(x)
 
-        # Mask: True where padding
-        padding_mask = (seq == padding_value)
+        # padding mask
+        padding_mask = seq.eq(0)
 
-        # Zero out padding positions in the embedding
-        x = x * (~padding_mask).float().unsqueeze(-1)
-
+        # causal mask
         L = seq.size(1)
         causal_mask = torch.triu(torch.ones(L, L, device=device), diagonal=1).bool()
 
@@ -52,47 +51,52 @@ class SimpleSASRec(nn.Module):
         h = self.layer_norm(h)
         return h
 
-    def forward(self, seq, pos_target, neg_target, padding_value=-1):
-        h = self.encode(seq, padding_value)
+    def forward(self, seq, pos, neg):
+        h = self.encode(seq)  # [B, L, H]
 
-        # Replace padding in targets with 0 for embedding lookup
-        pos_for_emb = pos_target.clone()
-        pos_for_emb[pos_for_emb == padding_value] = 0
-        neg_for_emb = neg_target.clone()
-        neg_for_emb[neg_for_emb == padding_value] = 0
+        pos_emb = self.item_embedding(pos)  # [B, L, H]
+        neg_emb = self.item_embedding(neg)  # [B, L, sasrec_num_neg, H]
 
-        pos_emb = self.item_embedding(pos_for_emb)
-        neg_emb = self.item_embedding(neg_for_emb)
+        pos_logits = (h * pos_emb).sum(dim=-1)  # [B, L]
 
-        pos_logits = (h * pos_emb).sum(dim=-1)
-        neg_logits = (h * neg_emb).sum(dim=-1)
+        # h: [B, L, H] -> [B, L, 1, H] to broadcast with neg_emb
+        h_expand = h.unsqueeze(2)  # [B, L, 1, H]
+        neg_logits = (h_expand * neg_emb).sum(dim=-1)  # [B, L, sasrec_num_neg]
 
-        mask = (pos_target != padding_value).float()
+        mask = pos.ne(0).float()  # [B, L]
 
         pos_loss = -torch.log(torch.sigmoid(pos_logits) + 1e-24) * mask
-        neg_loss = -torch.log(1.0 - torch.sigmoid(neg_logits) + 1e-24) * mask
+
+        # Average negative loss across sasrec_num_neg negatives per position
+        neg_loss_all = -torch.log(1.0 - torch.sigmoid(neg_logits) + 1e-24)  # [B, L, N]
+        neg_loss = neg_loss_all.mean(dim=-1) * mask  # [B, L]
 
         loss = (pos_loss + neg_loss).sum() / (mask.sum() + 1e-24)
         return loss
 
     @torch.no_grad()
-    def export_user_item_embeddings(self, user_history, n_users, device, padding_value=-1):
+    def export_user_item_embeddings(self, user_history, n_users, device):
+        """
+        Export:
+          user_emb[u] = last hidden state of user's train sequence
+          item_emb = learned item embedding table
+        """
         self.eval()
-        user_emb = torch.zeros((n_users, self.hidden_units), dtype=torch.float32, device=device)
+        user_emb = torch.zeros((n_users + 1, self.hidden_units), dtype=torch.float32, device=device)
 
-        for u in range(n_users):
+        for u in range(1, n_users + 1):
             seq_items = user_history.get(u, [])
             if len(seq_items) == 0:
                 continue
 
-            seq = np.full(self.max_len, padding_value, dtype=np.int64)
+            seq = np.zeros(self.max_len, dtype=np.int64)
             trunc = seq_items[-self.max_len:]
             seq[-len(trunc):] = trunc
 
             seq_tensor = torch.tensor(seq, dtype=torch.long, device=device).unsqueeze(0)
-            h = self.encode(seq_tensor, padding_value)
+            h = self.encode(seq_tensor)  # [1, L, H]
 
-            valid_pos = (seq_tensor != padding_value).sum().item() - 1
+            valid_pos = (seq_tensor != 0).sum().item() - 1
             if valid_pos >= 0:
                 user_emb[u] = h[0, valid_pos]
 
@@ -131,12 +135,12 @@ def pretrain_sasrec(
         model.train()
         losses = []
 
-        for _, seq, pos_target, neg_target in loader:
+        for _, seq, pos, neg in loader:
             seq = seq.to(device)
-            pos_target = pos_target.to(device)
-            neg_target = neg_target.to(device)
+            pos = pos.to(device)
+            neg = neg.to(device)
 
-            loss = model(seq, pos_target, neg_target)
+            loss = model(seq, pos, neg)
 
             optimizer.zero_grad()
             loss.backward()

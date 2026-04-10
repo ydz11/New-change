@@ -16,24 +16,52 @@ class EvalDataset(Dataset):
         return self.users[idx], self.candidates[idx]
 
 
-def build_eval_candidates(pos_ui, n_items, user_seen_items, num_neg=100, seed=42):
-    """IDs start from 0. Items are 0..n_items-1."""
+def build_eval_candidates(eval_user_item_pairs, n_items, user_seen_items, num_neg=100, seed=42):
+    """
+    Build evaluation candidate sets. Supports multiple positive items per user.
+
+    Parameters
+    ----------
+    eval_user_item_pairs : np.ndarray, shape [N, 2]
+        Each row is (user_id, positive_item_id) from the validation or test set.
+        A user may appear multiple times if they have multiple positive items.
+    n_items : int
+        Total number of items.
+    user_seen_items : list[set]
+        user_seen_items[u] = set of item IDs that user u has already interacted
+        with in training (for valid) or training+valid (for test).
+        Negative samples are drawn from items NOT in this set, matching
+        the same exclusion criteria used for training negative sampling.
+    num_neg : int
+        Number of negative items to sample per positive item.
+    seed : int
+        Random seed for reproducibility.
+
+    Returns
+    -------
+    eval_users : np.ndarray, shape [N]
+        User IDs (one per candidate row, may repeat for multi-positive users).
+    eval_candidates : np.ndarray, shape [N, 1 + num_neg]
+        Each row: [positive_item, neg_1, neg_2, ..., neg_{num_neg}].
+    """
     rng = np.random.default_rng(seed)
-    users = pos_ui[:, 0].astype(np.int64)
-    pos_items = pos_ui[:, 1].astype(np.int64)
+    users = eval_user_item_pairs[:, 0].astype(np.int64)
+    pos_items = eval_user_item_pairs[:, 1].astype(np.int64)
 
     candidates = np.zeros((len(users), 1 + num_neg), dtype=np.int64)
     candidates[:, 0] = pos_items
 
-    all_items = np.arange(0, n_items, dtype=np.int64)  # 0-indexed
+    all_items = np.arange(1, n_items + 1, dtype=np.int64)
 
     for idx, (u, pos_i) in enumerate(zip(users.tolist(), pos_items.tolist())):
+        # Exclude items the user has seen in prior splits (same criteria as
+        # training negative sampling), plus the current positive item itself
         excluded = set(user_seen_items[int(u)])
         excluded.add(int(pos_i))
 
         mask = np.ones(n_items, dtype=bool)
-        excluded_arr = np.array(list(excluded), dtype=np.int64)
-        mask[excluded_arr] = False
+        excluded_idx = np.array(list(excluded), dtype=np.int64) - 1
+        mask[excluded_idx] = False
         pool = all_items[mask]
 
         sampled = rng.choice(pool, size=num_neg, replace=False)
@@ -49,26 +77,54 @@ def ndcg_from_rank(rank, k):
 
 
 @torch.no_grad()
-def evaluate_model(model, users, candidates, k, device, batch_size=4096):
+def evaluate_model(model, eval_users, eval_candidates, k, device, batch_size=4096):
+    """
+    Evaluate model on candidate sets. Supports multiple positive items per user.
+    When a user has multiple candidate rows, their HR/NDCG are averaged per-user
+    first, then averaged across users.
+
+    Parameters
+    ----------
+    eval_users : np.ndarray, shape [N]
+    eval_candidates : np.ndarray, shape [N, 1 + num_neg]
+    k : int
+    device : torch.device
+    batch_size : int
+    """
     model.eval()
 
-    ds = EvalDataset(users, candidates)
+    ds = EvalDataset(eval_users, eval_candidates)
     dl = DataLoader(ds, batch_size=batch_size, shuffle=False)
 
-    hits = []
-    ndcgs = []
+    # Collect per-row results with user IDs for per-user averaging
+    row_users = []
+    row_hits = []
+    row_ndcgs = []
 
     for u, items in dl:
         bsz, n_cand = items.shape
-        u = u.to(device).view(-1, 1).expand(bsz, n_cand).reshape(-1)
+        u_ids = u.clone()  # keep original user IDs for grouping
+        u_exp = u.to(device).view(-1, 1).expand(bsz, n_cand).reshape(-1)
         items = items.to(device).reshape(-1)
 
-        scores = model(u, items).view(bsz, n_cand)
+        scores = model(u_exp, items).view(bsz, n_cand)
         pos_score = scores[:, 0].unsqueeze(1)
         rank = 1 + (scores[:, 1:] > pos_score).sum(dim=1)
 
-        for r in rank.cpu().tolist():
-            hits.append(1.0 if r <= k else 0.0)
-            ndcgs.append(ndcg_from_rank(int(r), k))
+        for uid, r in zip(u_ids.tolist(), rank.cpu().tolist()):
+            row_users.append(uid)
+            row_hits.append(1.0 if r <= k else 0.0)
+            row_ndcgs.append(ndcg_from_rank(int(r), k))
 
-    return float(np.mean(hits)), float(np.mean(ndcgs))
+    # Average per-user, then average across users
+    from collections import defaultdict
+    user_hits = defaultdict(list)
+    user_ndcgs = defaultdict(list)
+    for uid, h, n in zip(row_users, row_hits, row_ndcgs):
+        user_hits[uid].append(h)
+        user_ndcgs[uid].append(n)
+
+    avg_hr = np.mean([np.mean(v) for v in user_hits.values()])
+    avg_ndcg = np.mean([np.mean(v) for v in user_ndcgs.values()])
+
+    return float(avg_hr), float(avg_ndcg)
