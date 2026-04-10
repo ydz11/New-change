@@ -17,33 +17,6 @@ class EvalDataset(Dataset):
 
 
 def build_eval_candidates(eval_user_item_pairs, n_items, user_seen_items, num_neg=100, seed=42):
-    """
-    Build evaluation candidate sets. Supports multiple positive items per user.
-
-    Parameters
-    ----------
-    eval_user_item_pairs : np.ndarray, shape [N, 2]
-        Each row is (user_id, positive_item_id) from the validation or test set.
-        A user may appear multiple times if they have multiple positive items.
-    n_items : int
-        Total number of items.
-    user_seen_items : list[set]
-        user_seen_items[u] = set of item IDs that user u has already interacted
-        with in training (for valid) or training+valid (for test).
-        Negative samples are drawn from items NOT in this set, matching
-        the same exclusion criteria used for training negative sampling.
-    num_neg : int
-        Number of negative items to sample per positive item.
-    seed : int
-        Random seed for reproducibility.
-
-    Returns
-    -------
-    eval_users : np.ndarray, shape [N]
-        User IDs (one per candidate row, may repeat for multi-positive users).
-    eval_candidates : np.ndarray, shape [N, 1 + num_neg]
-        Each row: [positive_item, neg_1, neg_2, ..., neg_{num_neg}].
-    """
     rng = np.random.default_rng(seed)
     users = eval_user_item_pairs[:, 0].astype(np.int64)
     pos_items = eval_user_item_pairs[:, 1].astype(np.int64)
@@ -78,19 +51,6 @@ def ndcg_from_rank(rank, k):
 
 @torch.no_grad()
 def evaluate_model(model, eval_users, eval_candidates, k, device, batch_size=4096):
-    """
-    Evaluate model on candidate sets. Supports multiple positive items per user.
-    When a user has multiple candidate rows, their HR/NDCG are averaged per-user
-    first, then averaged across users.
-
-    Parameters
-    ----------
-    eval_users : np.ndarray, shape [N]
-    eval_candidates : np.ndarray, shape [N, 1 + num_neg]
-    k : int
-    device : torch.device
-    batch_size : int
-    """
     model.eval()
 
     ds = EvalDataset(eval_users, eval_candidates)

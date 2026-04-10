@@ -27,12 +27,6 @@ class NeighborAware(nn.Module):
         # ============================================================
         # Part B: Build neighbor lookup tables (from Step 1)
         # ============================================================
-        # For each user/item, store its top-K neighbor IDs as a buffer.
-        # Shape: [n_users+1, k] and [n_items+1, k]
-        # If a user/item has fewer than k neighbors, remaining slots are 0 (padding).
-        # These are registered as buffers (not parameters) so they move to GPU
-        # automatically but are not updated by the optimizer.
-
         user_topk = torch.zeros((n_users + 1, k), dtype=torch.long)
         for u, neigh_list in user_neighbors.items():
             neigh_list = neigh_list[:k]  # take at most k neighbors
@@ -49,15 +43,6 @@ class NeighborAware(nn.Module):
         # ============================================================
         # Part C: MLP for rating prediction (Step 4)
         # ============================================================
-        # Input: concatenation of user-side and item-side vectors
-        #   user-side = [target_user_emb, neighbor_1_emb, ..., neighbor_k_emb]
-        #             = (k+1) * emb_dim dimensions
-        #   item-side = same structure
-        #   total MLP input = 2 * (k+1) * emb_dim
-        #
-        # The MLP follows a tower/halving pattern (as in NCF paper Section 3.3):
-        #   input_dim -> input_dim//2 -> input_dim//4 -> 1
-
         mlp_input_dim = 2 * (k + 1) * emb_dim  # e.g., 2*6*16 = 192 for k=5, d=16
 
         self.mlp = nn.Sequential(
@@ -93,9 +78,6 @@ class NeighborAware(nn.Module):
         # ----------------------------------------------------------
         # Step 3c: Zero out padded neighbors
         # ----------------------------------------------------------
-        # If a user has fewer than k neighbors, some IDs are 0 (padding).
-        # The embedding at index 0 is already zeroed (padding_idx=0),
-        # but we explicitly mask to be safe.
         u_pad_mask = u_nei_ids.eq(0).unsqueeze(-1)  # [batch, k, 1]
         u_nei_emb = u_nei_emb.masked_fill(u_pad_mask, 0.0)
 

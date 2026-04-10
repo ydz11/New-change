@@ -42,7 +42,6 @@ class RatingWithNegDataset(Dataset):
         self.resample_negatives()
 
     def resample_negatives(self):
-        """Re-sample negative items each epoch for diversity."""
         n_total = self.n_pos * (1 + self.num_neg)
         users = np.zeros(n_total, dtype=np.int64)
         items = np.zeros(n_total, dtype=np.int64)

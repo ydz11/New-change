@@ -14,8 +14,6 @@ from data_utils import (
     filter_cold_start,
     reindex_ids,
     ratio_split,
-    build_user_history,
-    build_user_seen_items,
     build_train_uir,
     build_ui,
     get_num_users_items,
@@ -52,9 +50,7 @@ PATIENCE = 5
 SASREC_MAXLEN = 50
 SASREC_EPOCHS = 20
 SASREC_BATCH_SIZE = 128
-SASREC_NUM_NEG = 1  # negative samples per position for SASRec pretraining
-                     # (separate from NUM_NEG_TRAIN used in rating model training)
-
+SASREC_NUM_NEG = 1
 TOP_K = 10
 NUM_NEG_EVAL = 100
 
@@ -66,23 +62,21 @@ MIN_ITEM_INTERACTIONS = 5
 # GridSearch hyperparameter grid
 # =============================================================
 GRID = {
-    "factor":       [8, 16, 32, 64],
-    "lr":           [1e-4, 5e-4, 1e-3, 5e-3],
-    "weight_decay": [1e-5, 1e-4, 1e-3],
-    "num_neg_train": [2, 4, 6],
-    "dropout":      [0.1, 0.2, 0.3],
+    "factor":         [8, 16, 32, 64],
+    "lr":             [1e-4, 5e-4, 1e-3, 5e-3],
+    "weight_decay":   [1e-5, 1e-4, 1e-3],
+    "num_neg_train":  [2, 4, 6],
+    "dropout":        [0.1, 0.2, 0.3],
     "sasrec_num_neg": [1, 2, 4],
 }
 
 
 # =============================================================
-# Training function
+# Training function (only lr and weight_decay are grid-tuned)
 # =============================================================
 
 def train_rating_model(model, train_dataset, valid_users, valid_candidates,
-                       model_name, lr=LR, weight_decay=WEIGHT_DECAY,
-                       epochs=TRAIN_EPOCHS, batch_size=TRAIN_BATCH_SIZE,
-                       patience=PATIENCE):
+                       model_name, lr=LR, weight_decay=WEIGHT_DECAY):
     model = model.to(DEVICE)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     loss_fn = torch.nn.MSELoss()
@@ -91,9 +85,9 @@ def train_rating_model(model, train_dataset, valid_users, valid_candidates,
     best_state = None
     no_improve = 0
 
-    for epoch in range(1, epochs + 1):
+    for epoch in range(1, TRAIN_EPOCHS + 1):
         train_dataset.resample_negatives()
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+        train_loader = DataLoader(train_dataset, batch_size=TRAIN_BATCH_SIZE, shuffle=True)
 
         model.train()
         epoch_losses = []
@@ -126,12 +120,12 @@ def train_rating_model(model, train_dataset, valid_users, valid_candidates,
             no_improve = 0
         else:
             no_improve += 1
-            if no_improve >= patience:
+            if no_improve >= PATIENCE:
                 print(f"[{model_name}] Early stopping at epoch {epoch}")
                 break
 
     model.load_state_dict(best_state)
-    return model, best_ndcg
+    return model
 
 
 # =============================================================
@@ -185,8 +179,7 @@ def main():
           f"{df['user_id'].nunique()} users, {df['item_id'].nunique()} items")
 
     # ===========================================================
-    # 2.
-    # 0sers BEFORE anything else
+    # 2. Filter cold-start users/items BEFORE anything else
     # ===========================================================
     df = filter_cold_start(df,
                            min_user_interactions=MIN_USER_INTERACTIONS,
@@ -219,9 +212,16 @@ def main():
     valid_ui = build_ui(valid_df)
     test_ui = build_ui(test_df)
 
-    user_history = build_user_history(train_df)
+    # user_history: 直接从train_df按user分组提取
+    user_history = {}
+    for user_id, group in train_df.groupby("user_id"):
+        group = group.sort_values("timestamp")
+        user_history[int(user_id)] = group["item_id"].astype(int).tolist()
 
-    user_train_seen = build_user_seen_items(train_df, n_users)
+    # user_train_seen: 直接从train_df提取每个用户交互过的item集合
+    user_train_seen = [set() for _ in range(n_users + 1)]
+    for row in train_df.itertuples(index=False):
+        user_train_seen[int(row.user_id)].add(int(row.item_id))
 
     user_train_valid_seen = [set() for _ in range(n_users + 1)]
     for row in train_df.itertuples(index=False):
@@ -234,7 +234,7 @@ def main():
     # ===========================================================
     print("\n--- Step 1: Computing neighbors ---")
     user_neighbors, item_neighbors = build_neighbor_dicts(
-        train_uir=train_uir[:, :3].astype(np.float32),  # 只传 [user, item, rating]
+        train_uir=train_uir[:, :3].astype(np.float32),
         n_users=n_users,
         n_items=n_items,
         k=NEIGHBOR_K,
@@ -243,29 +243,22 @@ def main():
 
     # ===========================================================
     # Build evaluation candidates
-    # eval_user_item_pairs: [N, 2] array of (user_id, positive_item_id)
-    # Each user may have MULTIPLE positive items (rows) in valid/test.
-    # Negative sampling excludes the same items as training negatives.
     # ===========================================================
     valid_users, valid_candidates = build_eval_candidates(
-        valid_ui[:, :2].astype(np.int64),  # (user_id, item_id) pairs
+        valid_ui[:, :2].astype(np.int64),
         n_items, user_train_seen, num_neg=NUM_NEG_EVAL, seed=42
     )
     test_users, test_candidates = build_eval_candidates(
-        test_ui[:, :2].astype(np.int64),  # (user_id, item_id) pairs
+        test_ui[:, :2].astype(np.int64),
         n_items, user_train_valid_seen, num_neg=NUM_NEG_EVAL, seed=42
     )
-
-    # ===========================================================
-    # Build training dataset (will be rebuilt per grid config)
-    # ===========================================================
 
     # ===========================================================
     # GridSearch over all hyperparameters
     # All tuning data is saved to disk for the experiment section.
     # ===========================================================
-    all_tuning_results = []  # list of dicts, one per grid config
-    best_per_model = {}      # model_name -> {best config, best valid ndcg}
+    all_tuning_results = []
+    best_per_model = {}
 
     grid_keys = list(GRID.keys())
     grid_values = list(GRID.values())
@@ -294,7 +287,8 @@ def main():
         print(f"[Config {config_idx}/{total_configs}] {config}")
         print(f"{'='*60}")
 
-        # --- Rebuild training dataset with this config's num_neg_train ---
+        # --- Build training dataset ---
+        # Must rebuild when num_neg_train changes across grid configs
         train_dataset = RatingWithNegDataset(
             train_df=train_df,
             n_items=n_items,
@@ -302,7 +296,9 @@ def main():
             seed=42,
         )
 
-        # --- Pretrain SASRec with this config's sasrec_num_neg ---
+        # --- Step 2: Pretrain SASRec ---
+        print(f"\n--- Step 2: Pretraining SASRec (dim={emb_dim}, sasrec_num_neg={sasrec_num_neg}) ---")
+
         sasrec_train_dataset = SasRecTrainDataset(
             user_history=user_history,
             n_users=n_users,
@@ -328,7 +324,7 @@ def main():
             epochs=SASREC_EPOCHS,
         )
 
-        # --- Build and train all models with this config ---
+        # --- Build models ---
         models = {
             "MF": MF(n_users, n_items, embedding_dim=emb_dim),
 
@@ -344,9 +340,10 @@ def main():
             ),
         }
 
+        # --- Train all models ---
         for name, model in models.items():
             print(f"\n--- Training {name} (config {config_idx}) ---")
-            trained_model, valid_ndcg = train_rating_model(
+            trained_model = train_rating_model(
                 model=model,
                 train_dataset=train_dataset,
                 valid_users=valid_users,
@@ -356,11 +353,10 @@ def main():
                 weight_decay=weight_decay,
             )
 
-            # Evaluate on validation set
+            # --- Evaluate on validation and test ---
             valid_hr, valid_ndcg = evaluate_model(
                 trained_model, valid_users, valid_candidates, TOP_K, DEVICE
             )
-            # Evaluate on test set
             test_hr, test_ndcg = evaluate_model(
                 trained_model, test_users, test_candidates, TOP_K, DEVICE
             )
@@ -380,10 +376,12 @@ def main():
             if name not in best_per_model or valid_ndcg > best_per_model[name]["valid_ndcg"]:
                 best_per_model[name] = result_row.copy()
 
-            print(f"  {name:15s}  valid_hr@{TOP_K}={valid_hr:.4f}  valid_ndcg@{TOP_K}={valid_ndcg:.4f}"
-                  f"  test_hr@{TOP_K}={test_hr:.4f}  test_ndcg@{TOP_K}={test_ndcg:.4f}")
+            print(f"  {name:15s}  valid_hr@{TOP_K}={valid_hr:.4f}  "
+                  f"valid_ndcg@{TOP_K}={valid_ndcg:.4f}  "
+                  f"test_hr@{TOP_K}={test_hr:.4f}  "
+                  f"test_ndcg@{TOP_K}={test_ndcg:.4f}")
 
-        # --- Save tuning results incrementally (in case of crash) ---
+        # Save tuning results incrementally (in case of crash)
         with open(OUTPUT_DIR / "gridsearch_all_results.json", "w", encoding="utf-8") as f:
             json.dump(all_tuning_results, f, indent=2)
 
@@ -396,28 +394,25 @@ def main():
     with open(OUTPUT_DIR / "gridsearch_best_per_model.json", "w", encoding="utf-8") as f:
         json.dump(best_per_model, f, indent=2)
 
-    # --- Build summary table grouped by factor (for backward compat) ---
+    # Build summary grouped by factor for plotting (backward compat)
     all_results = {}
     for name, best in best_per_model.items():
-        factor = best["factor"]
-        if factor not in all_results:
-            all_results[factor] = {}
-        all_results[factor][name] = {"hr": best["test_hr"], "ndcg": best["test_ndcg"]}
+        f = best["factor"]
+        if f not in all_results:
+            all_results[f] = {}
+        all_results[f][name] = {"hr": best["test_hr"], "ndcg": best["test_ndcg"]}
 
     with open(OUTPUT_DIR / "results_by_factor.json", "w", encoding="utf-8") as f:
         json.dump(all_results, f, indent=2)
 
-    # Plot best results per factor
     if all_results:
         plot_results(all_results, OUTPUT_DIR)
 
-    print(f"\n{'='*60}")
-    print(f"GridSearch complete. All {len(all_tuning_results)} results saved to {OUTPUT_DIR}")
+    print(f"\nGridSearch complete. All {len(all_tuning_results)} results saved to {OUTPUT_DIR}")
     print(f"Best config per model:")
     for name, best in best_per_model.items():
         print(f"  {name}: valid_ndcg={best['valid_ndcg']:.4f}, "
               f"test_ndcg={best['test_ndcg']:.4f}, config={best}")
-    print(f"{'='*60}")
 
 
 if __name__ == "__main__":

@@ -93,20 +93,6 @@ def ratio_split(df, train_ratio=0.70, valid_ratio=0.15, test_ratio=0.15):
     return train_df, valid_df, test_df
 
 
-def build_user_history(train_df):
-    user_history = {}
-    for user_id, group in train_df.groupby("user_id"):
-        group = group.sort_values("timestamp")
-        user_history[int(user_id)] = group["item_id"].astype(int).tolist()
-    return user_history
-
-
-def build_user_seen_items(df, n_users):
-    seen_items = [set() for _ in range(n_users + 1)]
-    for row in df.itertuples(index=False):
-        seen_items[int(row.user_id)].add(int(row.item_id))
-    return seen_items
-
 
 def build_train_uir(train_df):
     return train_df[["user_id", "item_id", "rating", "timestamp"]].to_numpy(dtype=np.float64)

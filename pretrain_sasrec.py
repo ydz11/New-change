@@ -5,9 +5,6 @@ import numpy as np
 
 
 class SimpleSASRec(nn.Module):
-    """
-    A readable SASRec-style sequence encoder.
-    """
     def __init__(self, n_items, hidden_units=64, max_len=50, num_blocks=2, num_heads=1, dropout_rate=0.2):
         super().__init__()
         self.n_items = n_items
@@ -30,10 +27,6 @@ class SimpleSASRec(nn.Module):
         self.layer_norm = nn.LayerNorm(hidden_units)
 
     def encode(self, seq):
-        """
-        seq: [B, L]
-        return hidden states [B, L, H]
-        """
         device = seq.device
         positions = torch.arange(seq.size(1), device=device).unsqueeze(0).expand_as(seq)
 
@@ -76,11 +69,6 @@ class SimpleSASRec(nn.Module):
 
     @torch.no_grad()
     def export_user_item_embeddings(self, user_history, n_users, device):
-        """
-        Export:
-          user_emb[u] = last hidden state of user's train sequence
-          item_emb = learned item embedding table
-        """
         self.eval()
         user_emb = torch.zeros((n_users + 1, self.hidden_units), dtype=torch.float32, device=device)
 

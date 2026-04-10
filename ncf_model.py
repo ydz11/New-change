@@ -3,10 +3,6 @@ import torch.nn as nn
 
 
 class NCF(nn.Module):
-    """
-    NCF with MLP path only (matches proposal — fair comparison since
-    all models including NeighborAware only use MLP path).
-    """
     def __init__(self, n_users, n_items, embedding_dim, hidden_dims):
         super().__init__()
 
