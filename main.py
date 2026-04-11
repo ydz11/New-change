@@ -224,11 +224,11 @@ def main():
     for row in train_df.itertuples(index=False):
         user_train_only[int(row.user_id)].add(int(row.item_id))
 
-    user_eval_excluded = [s.copy() for s in user_train_only]
+    user_seen_items = [s.copy() for s in user_train_only]
     for row in valid_df.itertuples(index=False):
-        user_eval_excluded[int(row.user_id)].add(int(row.item_id))
+        user_seen_items[int(row.user_id)].add(int(row.item_id))
     for row in test_df.itertuples(index=False):
-        user_eval_excluded[int(row.user_id)].add(int(row.item_id))
+        user_seen_items[int(row.user_id)].add(int(row.item_id))
 
     # ===========================================================
     # Step 1: Compute cosine-based neighbors
@@ -247,11 +247,11 @@ def main():
     # ===========================================================
     valid_users, valid_candidates = build_eval_candidates(
         valid_ui[:, :2].astype(np.int64),
-        n_items, user_eval_excluded, num_neg=NUM_NEG_EVAL, seed=42
+        n_items, user_seen_items, num_neg=NUM_NEG_EVAL, seed=42
     )
     test_users, test_candidates = build_eval_candidates(
         test_ui[:, :2].astype(np.int64),
-        n_items, user_eval_excluded, num_neg=NUM_NEG_EVAL, seed=42
+        n_items, user_seen_items, num_neg=NUM_NEG_EVAL, seed=42
     )
 
     # ===========================================================
