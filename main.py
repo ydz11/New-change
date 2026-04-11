@@ -220,42 +220,11 @@ def main():
         group = group.sort_values("timestamp")
         user_history[int(user_id)] = group["item_id"].astype(int).tolist()
 
-    # ---------------------------------------------------------------
-    # 按时间段构建负采样排除集，避免信息泄露
-    # 时间轴：[训练集: 70%] | [验证集: 15%] | [测试集: 15%]
-    # ---------------------------------------------------------------
-
-    # user_train_seen: 只包含训练集的item
-    # 用于训练负采样（RatingWithNegDataset、SasRecTrainDataset）
-    user_train_seen = [set() for _ in range(n_users + 1)]
+    user_all_seen = [set() for _ in range(n_users + 1)]
     for row in train_df.itertuples(index=False):
-        user_train_seen[int(row.user_id)].add(int(row.item_id))
-
-    # 为了构建验证/测试的排除集，需要拿到验证、测试时间段的全部交互
-    # （包括被ratio_split丢弃的低评分交互），所以从原始df按时间重新切
-    user_valid_period_seen = [set() for _ in range(n_users + 1)]
-    user_test_period_seen = [set() for _ in range(n_users + 1)]
-    for user_id, group in df.groupby("user_id"):
-        group = group.sort_values("timestamp")
-        n = len(group)
-        n_train = int(n * 0.70)
-        n_valid = int(n * 0.15)
-        for row in group.iloc[n_train:n_train + n_valid].itertuples(index=False):
-            user_valid_period_seen[int(row.user_id)].add(int(row.item_id))
-        for row in group.iloc[n_train + n_valid:].itertuples(index=False):
-            user_test_period_seen[int(row.user_id)].add(int(row.item_id))
-
-    # user_seen_for_valid: 训练集 + 验证时间段全部交互
-    # 用于验证评估负采样
-    user_seen_for_valid = [set() for _ in range(n_users + 1)]
-    for u in range(n_users + 1):
-        user_seen_for_valid[u] = user_train_seen[u] | user_valid_period_seen[u]
-
-    # user_seen_for_test: 训练集 + 验证时间段 + 测试时间段全部交互
-    # 用于测试评估负采样
-    user_seen_for_test = [set() for _ in range(n_users + 1)]
-    for u in range(n_users + 1):
-        user_seen_for_test[u] = user_train_seen[u] | user_valid_period_seen[u] | user_test_period_seen[u]
+        user_all_seen[int(row.user_id)].add(int(row.item_id))
+    for row in valid_df.itertuples(index=False):
+        user_all_seen[int(row.user_id)].add(int(row.item_id))
 
     # ===========================================================
     # Step 1: Compute cosine-based neighbors
@@ -271,17 +240,14 @@ def main():
 
     # ===========================================================
     # Build evaluation candidates
-    # eval_user_item_pairs: [N, 2] array of (user_id, positive_item_id)
-    # Each user may have MULTIPLE positive items (rows) in valid/test.
-    # Negative sampling excludes the same items as training negatives.
     # ===========================================================
     valid_users, valid_candidates = build_eval_candidates(
         valid_ui[:, :2].astype(np.int64),
-        n_items, user_seen_for_valid, num_neg=NUM_NEG_EVAL, seed=42
+        n_items, user_all_seen, num_neg=NUM_NEG_EVAL, seed=42
     )
     test_users, test_candidates = build_eval_candidates(
         test_ui[:, :2].astype(np.int64),
-        n_items, user_seen_for_test, num_neg=NUM_NEG_EVAL, seed=42
+        n_items, user_all_seen, num_neg=NUM_NEG_EVAL, seed=42
     )
 
     # ===========================================================
@@ -323,7 +289,7 @@ def main():
         train_dataset = RatingWithNegDataset(
             train_df=train_df,
             n_items=n_items,
-            user_all_seen=user_train_seen,
+            user_all_seen=user_all_seen,
             num_neg=num_neg_train,
             seed=42,
         )
@@ -335,7 +301,7 @@ def main():
             user_history=user_history,
             n_users=n_users,
             n_items=n_items,
-            user_all_seen=user_train_seen,
+            user_all_seen=user_all_seen,
             max_len=SASREC_MAXLEN,
             sasrec_num_neg=sasrec_num_neg,
             seed=42,
