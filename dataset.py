@@ -21,7 +21,7 @@ class RatingTrainDataset(Dataset):
 
 
 class RatingWithNegDataset(Dataset):
-    def __init__(self, train_df, n_items, user_all_seen, num_neg=4, seed=42):
+    def __init__(self, train_df, n_items, num_neg=4, seed=42):
         self.n_items = n_items
         self.num_neg = num_neg
         self.rng = np.random.default_rng(seed)
@@ -31,13 +31,9 @@ class RatingWithNegDataset(Dataset):
         self.pos_ratings = train_df["rating"].values.astype(np.float32)
         self.n_pos = len(self.pos_users)
 
-        # user -> set of ALL interacted items (from full df, not just train_df)
-        # so that negatives never include items the user has interacted with
-        # in any split (including discarded low-rating items in valid/test)
         self.user_pos_items = {}
-        for u in range(len(user_all_seen)):
-            if len(user_all_seen[u]) > 0:
-                self.user_pos_items[u] = user_all_seen[u]
+        for u, i in zip(self.pos_users, self.pos_items):
+            self.user_pos_items.setdefault(int(u), set()).add(int(i))
 
         self.users = None
         self.items = None
